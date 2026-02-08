@@ -79,3 +79,7 @@ compile_commands.json
 /lua_modules
 /.luarocks
 *.rock
+
+*/node_modules
+nodejs/build
+nodejs/package-lock.json

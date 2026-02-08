@@ -1,0 +1,38 @@
+{
+  "name": "crun-binding",
+  "version": "1.0.0",
+  "description": "Node.js native binding for crun container runtime (OCI)",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "scripts": {
+    "postinstall": "bash scripts/build.sh",
+    "build": "node-gyp rebuild",
+    "build:crun": "bash scripts/build-crun.sh",
+    "clean": "node-gyp clean",
+    "clean:all": "node-gyp clean && cd deps/crun && make clean || true",
+    "test": "sudo node examples/test.js",
+    "prepare": "git submodule update --init --recursive"
+  },
+  "dependencies": {
+    "node-addon-api": "^7.0.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^10.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": ["linux"],
+  "cpu": ["x64", "arm64"],
+  "keywords": [
+    "container",
+    "crun",
+    "oci",
+    "runtime",
+    "docker",
+    "podman",
+    "linux"
+  ],
+  "license": "MIT",
+  "gypfile": true
+}
