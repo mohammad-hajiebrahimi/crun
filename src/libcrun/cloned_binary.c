@@ -538,6 +538,22 @@ extern char **environ;
 
 int ensure_cloned_binary(void)
 {
+
+	if (getenv("LIBCRUN_NO_REEXEC"))
+		return 0;
+
+	char self_exe[PATH_MAX] = {0};
+	ssize_t len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+	if (len > 0) {
+		self_exe[len] = '\0';
+
+		char *base = strrchr(self_exe, '/');
+		base = base ? base + 1 : self_exe;
+		if (strncmp(base, "crun", 4) != 0) {
+			return 0; 
+		}
+	}
+
 	cleanup_close int execfd = -1;
 	char **argv = NULL;
 
