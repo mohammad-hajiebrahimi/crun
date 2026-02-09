@@ -1058,7 +1058,14 @@ napi_value CrunState(napi_env env, napi_callback_info info) {
     return result;
 }
 
-
+/**
+ * list(options?) -> [{id, pid, status, bundle, created, owner}, ...]
+ *
+ * @param {object} [options] - تنظیمات اختیاری
+ * @param {string} [options.stateRoot] - مسیر state root
+ * @param {boolean} [options.systemdCgroup] - استفاده از systemd cgroup
+ * @param {boolean} [options.quiet] - فقط نمایش ID ها
+ */
 napi_value CrunList(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1], result;
@@ -1066,18 +1073,29 @@ napi_value CrunList(napi_env env, napi_callback_info info) {
     NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
     
     char* state_root = NULL;
+    bool systemd_cgroup = false;
+    bool quiet = false;
+    
     if (argc >= 1) {
         napi_valuetype type;
         napi_typeof(env, args[0], &type);
         if (type == napi_object) {
             state_root = get_string_property(env, args[0], "stateRoot");
+            systemd_cgroup = get_bool_property(env, args[0], "systemdCgroup", false);
+            quiet = get_bool_property(env, args[0], "quiet", false);
         }
     }
+
+    libcrun_context_t crun_context = {0};
     
-    const char* root = state_root ? state_root : "/run/crun";
+    crun_context.state_root = state_root;
+    crun_context.systemd_cgroup = systemd_cgroup ? 1 : 0;
+    crun_context.fifo_exec_wait_fd = -1;
     
     libcrun_error_t err = NULL;
     libcrun_container_list_t* list = NULL;
+    
+    const char* root = crun_context.state_root ? crun_context.state_root : "/run/crun";
     
     int ret = libcrun_get_containers_list(&list, root, &err);
     
@@ -1090,40 +1108,71 @@ napi_value CrunList(napi_env env, napi_callback_info info) {
     napi_create_array(env, &result);
     
     uint32_t index = 0;
-    libcrun_container_list_t* current = list;
+    libcrun_container_list_t* it;
     
-    while (current) {
+    for (it = list; it; it = it->next) {
         napi_value obj, val;
         napi_create_object(env, &obj);
         
-        napi_create_string_utf8(env, current->name, NAPI_AUTO_LENGTH, &val);
+        napi_create_string_utf8(env, it->name, NAPI_AUTO_LENGTH, &val);
         napi_set_named_property(env, obj, "id", val);
-        
-        libcrun_container_status_t status = {0};
-        if (libcrun_read_container_status(&status, root, current->name, NULL) >= 0) {
-            napi_create_int32(env, status.pid, &val);
+
+        if (!quiet) {
+            libcrun_container_status_t status = {0};
+            
+            ret = libcrun_read_container_status(&status, root, it->name, &err);
+            if (ret < 0) {
+
+                if (err) libcrun_error_release(&err);
+                napi_set_element(env, result, index++, obj);
+                continue;
+            }
+            
+            int running = 0;
+            const char* container_status = NULL;
+            
+            ret = libcrun_get_container_state_string(
+                it->name, &status, root, &container_status, &running, &err
+            );
+            
+            if (ret < 0) {
+                if (err) libcrun_error_release(&err);
+                libcrun_free_container_status(&status);
+                napi_set_element(env, result, index++, obj);
+                continue;
+            }
+            
+            int pid = running ? status.pid : 0;
+            napi_create_int32(env, pid, &val);
             napi_set_named_property(env, obj, "pid", val);
+
+            if (container_status) {
+                napi_create_string_utf8(env, container_status, NAPI_AUTO_LENGTH, &val);
+                napi_set_named_property(env, obj, "status", val);
+            }
             
-            int running = libcrun_is_container_running(&status, NULL);
-            const char* status_str = (running > 0) ? "running" : "stopped";
-            napi_create_string_utf8(env, status_str, NAPI_AUTO_LENGTH, &val);
-            napi_set_named_property(env, obj, "status", val);
-            
+            /* bundle */
             if (status.bundle) {
                 napi_create_string_utf8(env, status.bundle, NAPI_AUTO_LENGTH, &val);
                 napi_set_named_property(env, obj, "bundle", val);
             }
             
+            /* created */
             if (status.created) {
                 napi_create_string_utf8(env, status.created, NAPI_AUTO_LENGTH, &val);
                 napi_set_named_property(env, obj, "created", val);
+            }
+            
+            /* owner */
+            if (status.owner) {
+                napi_create_string_utf8(env, status.owner, NAPI_AUTO_LENGTH, &val);
+                napi_set_named_property(env, obj, "owner", val);
             }
             
             libcrun_free_container_status(&status);
         }
         
         napi_set_element(env, result, index++, obj);
-        current = current->next;
     }
     
     libcrun_free_containers_list(list);
