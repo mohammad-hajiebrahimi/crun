@@ -1941,7 +1941,6 @@ napi_value CrunUpdate(napi_env env, napi_callback_info info) {
     return result;
 }
 /**
- * نمایش پروسه‌های کانتینر
  * ps(id, options?) -> [{PID, PPID, UID, STIME, TTY, TIME, CMD, C}, ...]
  *
  * @param {string} id - شناسه کانتینر
@@ -1950,7 +1949,7 @@ napi_value CrunUpdate(napi_env env, napi_callback_info info) {
  * @param {boolean} [options.systemdCgroup] - استفاده از systemd cgroup
  */
 
-/* خواندن اطلاعات پروسه از /proc/[pid]/stat و /proc/[pid]/status */
+
 static napi_value read_ps_info(napi_env env, int pid) {
     napi_value obj, val;
     napi_create_object(env, &obj);
@@ -1958,12 +1957,10 @@ static napi_value read_ps_info(napi_env env, int pid) {
     char path[PATH_MAX];
     char pid_str[32];
     snprintf(pid_str, sizeof(pid_str), "%d", pid);
-    
-    /* PID */
+
     napi_create_string_utf8(env, pid_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "PID", val);
-    
-    /* خواندن /proc/[pid]/stat */
+
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     FILE* f = fopen(path, "r");
     if (!f) {
@@ -1983,8 +1980,7 @@ static napi_value read_ps_info(napi_env env, int pid) {
     char comm[256], state;
     unsigned long utime, stime;
     unsigned long long starttime;
-    
-    /* خواندن فیلدهای /proc/[pid]/stat */
+
     if (fscanf(f, "%d (%255[^)]) %c %d %d %d %d",
                &stat_pid, comm, &state, &ppid, &pgrp, &session, &tty_nr) < 7) {
         fclose(f);
@@ -2002,17 +1998,14 @@ static napi_value read_ps_info(napi_env env, int pid) {
         return obj;
     }
     
-    /* خواندن utime و stime (فیلدهای ۱۴ و ۱۵) */
     rewind(f);
     char stat_line[4096];
     if (fgets(stat_line, sizeof(stat_line), f)) {
-        /* پیدا کردن بعد از ')' */
+
         char* after_comm = strchr(stat_line, ')');
         if (after_comm) {
-            after_comm += 2; /* skip ') ' */
-            /* فیلدها بعد از comm: state(1) ppid(2) pgrp(3) session(4) tty(5)
-               tpgid(6) flags(7) minflt(8) cminflt(9) majflt(10) cmajflt(11)
-               utime(12) stime(13) */
+            after_comm += 2;
+
             unsigned long dummy;
             sscanf(after_comm, "%c %d %d %d %d %lu %lu %lu %lu %lu %lu %lu %lu",
                    &state, &ppid, &pgrp, &session, &tty_nr,
@@ -2021,20 +2014,17 @@ static napi_value read_ps_info(napi_env env, int pid) {
         }
     }
     fclose(f);
-    
-    /* PPID */
+
     char ppid_str[32];
     snprintf(ppid_str, sizeof(ppid_str), "%d", ppid);
     napi_create_string_utf8(env, ppid_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "PPID", val);
-    
-    /* CMD - با پرانتز مثل خروجی نمونه */
+
     char cmd_buf[260];
     snprintf(cmd_buf, sizeof(cmd_buf), "(%s)", comm);
     napi_create_string_utf8(env, cmd_buf, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "CMD", val);
-    
-    /* UID از /proc/[pid]/status */
+
     snprintf(path, sizeof(path), "/proc/%d/status", pid);
     f = fopen(path, "r");
     char uid_str[32] = "0";
@@ -2052,20 +2042,17 @@ static napi_value read_ps_info(napi_env env, int pid) {
     }
     napi_create_string_utf8(env, uid_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "UID", val);
-    
-    /* STIME - start time (session leader pid مثل خروجی نمونه) */
+
     char stime_str[32];
     snprintf(stime_str, sizeof(stime_str), "%d", session);
     napi_create_string_utf8(env, stime_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "STIME", val);
-    
-    /* TTY */
+
     char tty_str[32];
     snprintf(tty_str, sizeof(tty_str), "%d", session);
     napi_create_string_utf8(env, tty_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "TTY", val);
-    
-    /* TIME - CPU time in clock ticks */
+
     long hz = sysconf(_SC_CLK_TCK);
     if (hz <= 0) hz = 100;
     unsigned long total_time = (utime + stime) / hz;
@@ -2073,8 +2060,7 @@ static napi_value read_ps_info(napi_env env, int pid) {
     snprintf(time_str, sizeof(time_str), "%lu", total_time);
     napi_create_string_utf8(env, time_str, NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "TIME", val);
-    
-    /* C - CPU utilization */
+
     napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &val);
     napi_set_named_property(env, obj, "C", val);
     
@@ -2082,6 +2068,201 @@ static napi_value read_ps_info(napi_env env, int pid) {
 }
 
 napi_value CrunPs(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2], result;
+    
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+    
+    if (argc < 1) {
+        return napi_create_error_obj(env, -1, "please specify a ID for the container");
+    }
+    
+    char* id = napi_get_string(env, args[0]);
+    if (!id) {
+        return napi_create_error_obj(env, -1, "Invalid container id");
+    }
+
+    char* state_root = NULL;
+    
+    if (argc >= 2) {
+        napi_valuetype type;
+        napi_typeof(env, args[1], &type);
+        if (type == napi_object) {
+            state_root = get_string_property(env, args[1], "stateRoot");
+        }
+    }
+    
+    const char* root = state_root ? state_root : "/run/crun";
+
+    libcrun_error_t err = NULL;
+    libcrun_container_status_t status = {0};
+    
+    int ret = libcrun_read_container_status(&status, root, id, &err);
+    if (ret < 0) {
+        napi_value error = create_error_from_crun(env, "Failed to read container status", &err);
+        free(id);
+        free(state_root);
+        return error;
+    }
+    
+    int running = libcrun_is_container_running(&status, &err);
+    if (running <= 0) {
+        libcrun_free_container_status(&status);
+        free(id);
+        free(state_root);
+        return napi_create_error_obj(env, -1, "container is not running");
+    }
+    
+    int* pids = NULL;
+    size_t pids_count = 0;
+    
+    if (status.cgroup_path) {
+        char cgroup_full[PATH_MAX];
+        snprintf(cgroup_full, sizeof(cgroup_full), "/sys/fs/cgroup/%s/cgroup.procs", status.cgroup_path);
+        
+        FILE* f = fopen(cgroup_full, "r");
+        if (f) {
+            char line[64];
+            while (fgets(line, sizeof(line), f)) {
+                int p = atoi(line);
+                if (p > 0) {
+                    pids = realloc(pids, (pids_count + 1) * sizeof(int));
+                    pids[pids_count++] = p;
+                }
+            }
+            fclose(f);
+        }
+    }
+    
+    if (!pids || pids_count == 0) {
+        pids = realloc(pids, sizeof(int));
+        pids[0] = status.pid;
+        pids_count = 1;
+        
+        char children_path[PATH_MAX];
+        snprintf(children_path, sizeof(children_path),
+                 "/proc/%d/task/%d/children", status.pid, status.pid);
+        
+        FILE* f = fopen(children_path, "r");
+        if (f) {
+            int child_pid;
+            while (fscanf(f, "%d", &child_pid) == 1) {
+                pids = realloc(pids, (pids_count + 1) * sizeof(int));
+                pids[pids_count++] = child_pid;
+            }
+            fclose(f);
+        }
+    }
+
+    napi_create_array(env, &result);
+    
+    for (size_t i = 0; i < pids_count; i++) {
+        napi_value proc_info = read_ps_info(env, pids[i]);
+        napi_set_element(env, result, (uint32_t)i, proc_info);
+    }
+
+    free(pids);
+    libcrun_free_container_status(&status);
+    free(id);
+    free(state_root);
+    
+    return result;
+}
+
+/**
+ * دریافت مصرف منابع کانتینر از cgroup
+ * resourceUsage(id, options?) -> {memoryStats, cpuStats, ioStats}
+ */
+
+/* خواندن محتوای یک فایل cgroup */
+static char* read_cgroup_file_content(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (!f) return NULL;
+    
+    char* content = (char*)calloc(1, 8192);
+    if (!content) { fclose(f); return NULL; }
+    
+    size_t n = fread(content, 1, 8191, f);
+    content[n] = '\0';
+    fclose(f);
+    
+    /* حذف newline انتها */
+    if (n > 0 && content[n-1] == '\n') content[n-1] = '\0';
+    
+    return content;
+}
+
+/* اضافه کردن یک فایل cgroup به آبجکت */
+static void add_cgroup_stat(napi_env env, napi_value obj,
+                            const char* cgroup_path, const char* file,
+                            const char* key) {
+    char full_path[PATH_MAX];
+    snprintf(full_path, sizeof(full_path), "%s%s", cgroup_path, file);
+    
+    char* content = read_cgroup_file_content(full_path);
+    
+    napi_value val;
+    if (content) {
+        napi_create_string_utf8(env, content, NAPI_AUTO_LENGTH, &val);
+        free(content);
+    } else {
+        napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &val);
+    }
+    
+    napi_set_named_property(env, obj, key, val);
+}
+
+/* جمع‌آوری Memory Stats - دقیقاً مثل collectMemoryStats */
+static napi_value collect_memory_stats(napi_env env, const char* cgroup_path) {
+    napi_value obj;
+    napi_create_object(env, &obj);
+    
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.current",      "Memory Current");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.max",          "Memory Max");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.high",         "Memory High");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.swap.max",     "Memory Swap Max");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.swap.high",    "Memory Swap High");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.swap.current", "Memory Swap Current");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.low",          "Memory Low");
+    add_cgroup_stat(env, obj, cgroup_path, "/memory.min",          "Memory Min");
+    
+    return obj;
+}
+
+/* جمع‌آوری CPU Stats - دقیقاً مثل collectCpuStats */
+static napi_value collect_cpu_stats(napi_env env, const char* cgroup_path) {
+    napi_value obj;
+    napi_create_object(env, &obj);
+    
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.stat",                "CPU Usage");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.pressure",            "CPU Pressure");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.max",                 "CPU Max");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.weight",              "CPU Weight");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.weight.nice",         "CPU Weight Nice");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.uclamp.min",          "CPU Uclamp Min");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpu.uclamp.max",          "CPU Uclamp Max");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpuset.cpus.effective",   "Effective CPUs");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpuset.cpus.exclusive",   "Exclusive CPUs");
+    add_cgroup_stat(env, obj, cgroup_path, "/cpuset.cpus.partition",   "Partition CPUs");
+    
+    return obj;
+}
+
+/* جمع‌آوری IO Stats - دقیقاً مثل collectIoStats */
+static napi_value collect_io_stats(napi_env env, const char* cgroup_path) {
+    napi_value obj;
+    napi_create_object(env, &obj);
+    
+    add_cgroup_stat(env, obj, cgroup_path, "/io.max",        "IO Max");
+    add_cgroup_stat(env, obj, cgroup_path, "/io.pressure",   "IO Pressure");
+    add_cgroup_stat(env, obj, cgroup_path, "/io.prio.class", "IO Priority Class");
+    add_cgroup_stat(env, obj, cgroup_path, "/io.stat",       "IO Stat");
+    add_cgroup_stat(env, obj, cgroup_path, "/io.weight",     "IO Weight");
+    
+    return obj;
+}
+
+napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value args[2], result;
     
@@ -2109,7 +2290,7 @@ napi_value CrunPs(napi_env env, napi_callback_info info) {
     
     const char* root = state_root ? state_root : "/run/crun";
     
-    /* خواندن وضعیت کانتینر */
+    /* خواندن وضعیت کانتینر برای پیدا کردن cgroup_path */
     libcrun_error_t err = NULL;
     libcrun_container_status_t status = {0};
     
@@ -2130,60 +2311,54 @@ napi_value CrunPs(napi_env env, napi_callback_info info) {
         return napi_create_error_obj(env, -1, "container is not running");
     }
     
-    /* جمع‌آوری PID ها */
-    int* pids = NULL;
-    size_t pids_count = 0;
+    /* ساخت مسیر cgroup */
+    char cgroup_path[PATH_MAX];
+    cgroup_path[0] = '\0';
     
-    /* روش ۱: از cgroup */
     if (status.cgroup_path) {
-        char cgroup_full[PATH_MAX];
-        snprintf(cgroup_full, sizeof(cgroup_full), "/sys/fs/cgroup/%s/cgroup.procs", status.cgroup_path);
+        snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/%s", status.cgroup_path);
+    } else {
+        /* fallback: خواندن از /proc/[pid]/cgroup */
+        char proc_cgroup[PATH_MAX];
+        snprintf(proc_cgroup, sizeof(proc_cgroup), "/proc/%d/cgroup", status.pid);
         
-        FILE* f = fopen(cgroup_full, "r");
+        FILE* f = fopen(proc_cgroup, "r");
         if (f) {
-            char line[64];
+            char line[1024];
             while (fgets(line, sizeof(line), f)) {
-                int p = atoi(line);
-                if (p > 0) {
-                    pids = realloc(pids, (pids_count + 1) * sizeof(int));
-                    pids[pids_count++] = p;
+                if (strncmp(line, "0::", 3) == 0) {
+                    char* path = line + 3;
+                    size_t len = strlen(path);
+                    if (len > 0 && path[len-1] == '\n') path[len-1] = '\0';
+                    snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup%s", path);
+                    break;
                 }
             }
             fclose(f);
         }
     }
     
-    /* روش ۲: fallback - PID اصلی + children */
-    if (!pids || pids_count == 0) {
-        pids = realloc(pids, sizeof(int));
-        pids[0] = status.pid;
-        pids_count = 1;
-        
-        char children_path[PATH_MAX];
-        snprintf(children_path, sizeof(children_path),
-                 "/proc/%d/task/%d/children", status.pid, status.pid);
-        
-        FILE* f = fopen(children_path, "r");
-        if (f) {
-            int child_pid;
-            while (fscanf(f, "%d", &child_pid) == 1) {
-                pids = realloc(pids, (pids_count + 1) * sizeof(int));
-                pids[pids_count++] = child_pid;
-            }
-            fclose(f);
-        }
+    if (cgroup_path[0] == '\0') {
+        libcrun_free_container_status(&status);
+        free(id);
+        free(state_root);
+        return napi_create_error_obj(env, -1, "Cannot find cgroup path");
     }
     
-    /* ساخت آرایه نتیجه */
-    napi_create_array(env, &result);
+    /* ساخت آبجکت نتیجه */
+    napi_create_object(env, &result);
     
-    for (size_t i = 0; i < pids_count; i++) {
-        napi_value proc_info = read_ps_info(env, pids[i]);
-        napi_set_element(env, result, (uint32_t)i, proc_info);
-    }
+    /* جمع‌آوری آمار - دقیقاً مثل کد اصلی */
+    napi_value memory_stats = collect_memory_stats(env, cgroup_path);
+    napi_set_named_property(env, result, "memoryStats", memory_stats);
+    
+    napi_value cpu_stats = collect_cpu_stats(env, cgroup_path);
+    napi_set_named_property(env, result, "cpuStats", cpu_stats);
+    
+    napi_value io_stats = collect_io_stats(env, cgroup_path);
+    napi_set_named_property(env, result, "ioStats", io_stats);
     
     /* آزادسازی */
-    free(pids);
     libcrun_free_container_status(&status);
     free(id);
     free(state_root);
@@ -2207,6 +2382,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"spec", NULL, CrunSpec, NULL, NULL, NULL, napi_default, NULL},
         {"update", NULL, CrunUpdate, NULL, NULL, NULL, napi_default, NULL},
         {"ps",      NULL, CrunPs,     NULL, NULL, NULL, napi_default, NULL},
+        {"resourceUsage", NULL, CrunResourceUsage, NULL, NULL, NULL, napi_default, NULL},
     };
     
     NAPI_CALL(env, napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props));
