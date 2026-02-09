@@ -1940,8 +1940,256 @@ napi_value CrunUpdate(napi_env env, napi_callback_info info) {
     
     return result;
 }
+/**
+ * نمایش پروسه‌های کانتینر
+ * ps(id, options?) -> [{PID, PPID, UID, STIME, TTY, TIME, CMD, C}, ...]
+ *
+ * @param {string} id - شناسه کانتینر
+ * @param {object} [options] - تنظیمات اختیاری
+ * @param {string} [options.stateRoot] - مسیر state root
+ * @param {boolean} [options.systemdCgroup] - استفاده از systemd cgroup
+ */
 
+/* خواندن اطلاعات پروسه از /proc/[pid]/stat و /proc/[pid]/status */
+static napi_value read_ps_info(napi_env env, int pid) {
+    napi_value obj, val;
+    napi_create_object(env, &obj);
+    
+    char path[PATH_MAX];
+    char pid_str[32];
+    snprintf(pid_str, sizeof(pid_str), "%d", pid);
+    
+    /* PID */
+    napi_create_string_utf8(env, pid_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "PID", val);
+    
+    /* خواندن /proc/[pid]/stat */
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, obj, "PPID", val);
+        napi_set_named_property(env, obj, "UID", val);
+        napi_set_named_property(env, obj, "STIME", val);
+        napi_set_named_property(env, obj, "TTY", val);
+        napi_set_named_property(env, obj, "TIME", val);
+        napi_set_named_property(env, obj, "C", val);
+        napi_create_string_utf8(env, "unknown", NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, obj, "CMD", val);
+        return obj;
+    }
+    
+    int stat_pid, ppid, pgrp, session, tty_nr;
+    char comm[256], state;
+    unsigned long utime, stime;
+    unsigned long long starttime;
+    
+    /* خواندن فیلدهای /proc/[pid]/stat */
+    if (fscanf(f, "%d (%255[^)]) %c %d %d %d %d",
+               &stat_pid, comm, &state, &ppid, &pgrp, &session, &tty_nr) < 7) {
+        fclose(f);
+        napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, obj, "PPID", val);
+        napi_set_named_property(env, obj, "UID", val);
+        napi_set_named_property(env, obj, "STIME", val);
+        napi_set_named_property(env, obj, "TTY", val);
+        napi_set_named_property(env, obj, "TIME", val);
+        napi_set_named_property(env, obj, "C", val);
+        char cmd_buf[260];
+        snprintf(cmd_buf, sizeof(cmd_buf), "(%s)", comm);
+        napi_create_string_utf8(env, cmd_buf, NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, obj, "CMD", val);
+        return obj;
+    }
+    
+    /* خواندن utime و stime (فیلدهای ۱۴ و ۱۵) */
+    rewind(f);
+    char stat_line[4096];
+    if (fgets(stat_line, sizeof(stat_line), f)) {
+        /* پیدا کردن بعد از ')' */
+        char* after_comm = strchr(stat_line, ')');
+        if (after_comm) {
+            after_comm += 2; /* skip ') ' */
+            /* فیلدها بعد از comm: state(1) ppid(2) pgrp(3) session(4) tty(5)
+               tpgid(6) flags(7) minflt(8) cminflt(9) majflt(10) cmajflt(11)
+               utime(12) stime(13) */
+            unsigned long dummy;
+            sscanf(after_comm, "%c %d %d %d %d %lu %lu %lu %lu %lu %lu %lu %lu",
+                   &state, &ppid, &pgrp, &session, &tty_nr,
+                   &dummy, &dummy, &dummy, &dummy, &dummy, &dummy,
+                   &utime, &stime);
+        }
+    }
+    fclose(f);
+    
+    /* PPID */
+    char ppid_str[32];
+    snprintf(ppid_str, sizeof(ppid_str), "%d", ppid);
+    napi_create_string_utf8(env, ppid_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "PPID", val);
+    
+    /* CMD - با پرانتز مثل خروجی نمونه */
+    char cmd_buf[260];
+    snprintf(cmd_buf, sizeof(cmd_buf), "(%s)", comm);
+    napi_create_string_utf8(env, cmd_buf, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "CMD", val);
+    
+    /* UID از /proc/[pid]/status */
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    f = fopen(path, "r");
+    char uid_str[32] = "0";
+    if (f) {
+        char line[1024];
+        while (fgets(line, sizeof(line), f)) {
+            if (strncmp(line, "Uid:", 4) == 0) {
+                int uid;
+                sscanf(line + 4, "%d", &uid);
+                snprintf(uid_str, sizeof(uid_str), "%d", uid);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    napi_create_string_utf8(env, uid_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "UID", val);
+    
+    /* STIME - start time (session leader pid مثل خروجی نمونه) */
+    char stime_str[32];
+    snprintf(stime_str, sizeof(stime_str), "%d", session);
+    napi_create_string_utf8(env, stime_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "STIME", val);
+    
+    /* TTY */
+    char tty_str[32];
+    snprintf(tty_str, sizeof(tty_str), "%d", session);
+    napi_create_string_utf8(env, tty_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "TTY", val);
+    
+    /* TIME - CPU time in clock ticks */
+    long hz = sysconf(_SC_CLK_TCK);
+    if (hz <= 0) hz = 100;
+    unsigned long total_time = (utime + stime) / hz;
+    char time_str[32];
+    snprintf(time_str, sizeof(time_str), "%lu", total_time);
+    napi_create_string_utf8(env, time_str, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "TIME", val);
+    
+    /* C - CPU utilization */
+    napi_create_string_utf8(env, "0", NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, obj, "C", val);
+    
+    return obj;
+}
 
+napi_value CrunPs(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2], result;
+    
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+    
+    if (argc < 1) {
+        return napi_create_error_obj(env, -1, "please specify a ID for the container");
+    }
+    
+    char* id = napi_get_string(env, args[0]);
+    if (!id) {
+        return napi_create_error_obj(env, -1, "Invalid container id");
+    }
+    
+    /* خواندن options */
+    char* state_root = NULL;
+    
+    if (argc >= 2) {
+        napi_valuetype type;
+        napi_typeof(env, args[1], &type);
+        if (type == napi_object) {
+            state_root = get_string_property(env, args[1], "stateRoot");
+        }
+    }
+    
+    const char* root = state_root ? state_root : "/run/crun";
+    
+    /* خواندن وضعیت کانتینر */
+    libcrun_error_t err = NULL;
+    libcrun_container_status_t status = {0};
+    
+    int ret = libcrun_read_container_status(&status, root, id, &err);
+    if (ret < 0) {
+        napi_value error = create_error_from_crun(env, "Failed to read container status", &err);
+        free(id);
+        free(state_root);
+        return error;
+    }
+    
+    /* بررسی اینکه کانتینر در حال اجراست */
+    int running = libcrun_is_container_running(&status, &err);
+    if (running <= 0) {
+        libcrun_free_container_status(&status);
+        free(id);
+        free(state_root);
+        return napi_create_error_obj(env, -1, "container is not running");
+    }
+    
+    /* جمع‌آوری PID ها */
+    int* pids = NULL;
+    size_t pids_count = 0;
+    
+    /* روش ۱: از cgroup */
+    if (status.cgroup_path) {
+        char cgroup_full[PATH_MAX];
+        snprintf(cgroup_full, sizeof(cgroup_full), "/sys/fs/cgroup/%s/cgroup.procs", status.cgroup_path);
+        
+        FILE* f = fopen(cgroup_full, "r");
+        if (f) {
+            char line[64];
+            while (fgets(line, sizeof(line), f)) {
+                int p = atoi(line);
+                if (p > 0) {
+                    pids = realloc(pids, (pids_count + 1) * sizeof(int));
+                    pids[pids_count++] = p;
+                }
+            }
+            fclose(f);
+        }
+    }
+    
+    /* روش ۲: fallback - PID اصلی + children */
+    if (!pids || pids_count == 0) {
+        pids = realloc(pids, sizeof(int));
+        pids[0] = status.pid;
+        pids_count = 1;
+        
+        char children_path[PATH_MAX];
+        snprintf(children_path, sizeof(children_path),
+                 "/proc/%d/task/%d/children", status.pid, status.pid);
+        
+        FILE* f = fopen(children_path, "r");
+        if (f) {
+            int child_pid;
+            while (fscanf(f, "%d", &child_pid) == 1) {
+                pids = realloc(pids, (pids_count + 1) * sizeof(int));
+                pids[pids_count++] = child_pid;
+            }
+            fclose(f);
+        }
+    }
+    
+    /* ساخت آرایه نتیجه */
+    napi_create_array(env, &result);
+    
+    for (size_t i = 0; i < pids_count; i++) {
+        napi_value proc_info = read_ps_info(env, pids[i]);
+        napi_set_element(env, result, (uint32_t)i, proc_info);
+    }
+    
+    /* آزادسازی */
+    free(pids);
+    libcrun_free_container_status(&status);
+    free(id);
+    free(state_root);
+    
+    return result;
+}
 
 napi_value Init(napi_env env, napi_value exports) {
 
@@ -1958,6 +2206,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"exec", NULL, CrunExec, NULL, NULL, NULL, napi_default, NULL},
         {"spec", NULL, CrunSpec, NULL, NULL, NULL, napi_default, NULL},
         {"update", NULL, CrunUpdate, NULL, NULL, NULL, napi_default, NULL},
+        {"ps",      NULL, CrunPs,     NULL, NULL, NULL, napi_default, NULL},
     };
     
     NAPI_CALL(env, napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props));
