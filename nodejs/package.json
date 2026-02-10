@@ -5,13 +5,8 @@
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "scripts": {
-    "postinstall": "bash scripts/build.sh",
     "build": "node-gyp rebuild",
-    "build:crun": "bash scripts/build-crun.sh",
-    "clean": "node-gyp clean",
-    "clean:all": "node-gyp clean && cd deps/crun && make clean || true",
-    "test": "sudo node examples/test.js",
-    "prepare": "git submodule update --init --recursive"
+    "clean": "node-gyp clean"
   },
   "dependencies": {
     "node-addon-api": "^7.0.0"

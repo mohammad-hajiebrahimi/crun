@@ -420,6 +420,7 @@ napi_value CrunStart(napi_env env, napi_callback_info info) {
  * @param {boolean} [options.noPivot] - عدم استفاده از pivot_root
  * @param {boolean} [options.noNewKeyring] - حفظ session key
  */
+
 napi_value CrunRun(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value args[3], result;
@@ -438,11 +439,12 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
         free(bundle_arg);
         return napi_create_error_obj(env, -1, "Invalid id or bundle path");
     }
-    
+
     char* state_root = NULL;
     char* console_socket = NULL;
     char* pid_file = NULL;
     char* config_file_arg = NULL;
+    char* log_file = NULL;
     bool systemd_cgroup = false;
     bool detach = true;
     bool no_pivot = false;
@@ -458,6 +460,7 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
             console_socket = get_string_property(env, args[2], "consoleSocket");
             pid_file = get_string_property(env, args[2], "pidFile");
             config_file_arg = get_string_property(env, args[2], "configFile");
+            log_file = get_string_property(env, args[2], "logFile");
             systemd_cgroup = get_bool_property(env, args[2], "systemdCgroup", false);
             detach = get_bool_property(env, args[2], "detach", true);
             no_pivot = get_bool_property(env, args[2], "noPivot", false);
@@ -472,9 +475,10 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
             }
         }
     }
-
+    
     char* original_cwd = getcwd(NULL, 0);
     
+    /* config file */
     const char* config_file = "config.json";
     char* config_file_cleanup = NULL;
     
@@ -484,7 +488,8 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
             if (!config_file_cleanup) {
                 if (original_cwd) free(original_cwd);
                 free(id); free(bundle_arg); free(state_root);
-                free(console_socket); free(pid_file); free(config_file_arg);
+                free(console_socket); free(pid_file); 
+                free(config_file_arg); free(log_file);
                 return napi_create_error_obj(env, errno, "realpath config failed");
             }
             config_file = config_file_cleanup;
@@ -492,7 +497,7 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
             config_file = config_file_arg;
         }
     }
-    
+
     const char* bundle = NULL;
     char* bundle_cleanup = NULL;
     
@@ -502,7 +507,7 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
             if (original_cwd) free(original_cwd);
             free(id); free(bundle_arg); free(state_root);
             free(console_socket); free(pid_file);
-            free(config_file_arg); free(config_file_cleanup);
+            free(config_file_arg); free(config_file_cleanup); free(log_file);
             return napi_create_error_obj(env, errno, "realpath bundle failed");
         }
         bundle = bundle_cleanup;
@@ -515,12 +520,13 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
         if (original_cwd) free(original_cwd);
         free(id); free(bundle_arg); free(bundle_cleanup);
         free(state_root); free(console_socket);
-        free(pid_file); free(config_file_arg); free(config_file_cleanup);
+        free(pid_file); free(config_file_arg); 
+        free(config_file_cleanup); free(log_file);
         return napi_create_error_obj(env, e, "chdir to bundle failed");
     }
     
     libcrun_error_t err = NULL;
-    
+
     libcrun_container_t* container = libcrun_container_load_from_file(config_file, &err);
     
     if (!container) {
@@ -531,10 +537,25 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
         }
         free(id); free(bundle_arg); free(bundle_cleanup);
         free(state_root); free(console_socket);
-        free(pid_file); free(config_file_arg); free(config_file_cleanup);
+        free(pid_file); free(config_file_arg); 
+        free(config_file_cleanup); free(log_file);
         return error;
     }
     
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    int log_fd = -1;
+    
+    if (log_file) {
+        log_fd = open(log_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (log_fd >= 0) {
+            saved_stdout = dup(STDOUT_FILENO);
+            saved_stderr = dup(STDERR_FILENO);
+            dup2(log_fd, STDOUT_FILENO);
+            dup2(log_fd, STDERR_FILENO);
+        }
+    }
+
     libcrun_context_t crun_context = {0};
     
     crun_context.id = id;
@@ -557,10 +578,26 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
         crun_context.listen_fds = strtoll(getenv("LISTEN_FDS"), NULL, 10);
         crun_context.preserve_fds += crun_context.listen_fds;
     }
+
+    if (log_file && log_fd >= 0) {
+        crun_context.output_handler = log_fd;
+    }
     
     int ret = libcrun_container_run(&crun_context, container, 0, &err);
     
     libcrun_container_free(container);
+
+    if (saved_stdout >= 0) {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+    if (log_fd >= 0) {
+        close(log_fd);
+    }
     
     if (original_cwd) {
         int r __attribute__((unused)) = chdir(original_cwd);
@@ -571,7 +608,8 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
         napi_value error = create_error_from_crun(env, "Failed to run container", &err);
         free(id); free(bundle_arg); free(bundle_cleanup);
         free(state_root); free(console_socket);
-        free(pid_file); free(config_file_arg); free(config_file_cleanup);
+        free(pid_file); free(config_file_arg);
+        free(config_file_cleanup); free(log_file);
         return error;
     }
     
@@ -591,12 +629,18 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
     napi_create_int32(env, ret, &val);
     napi_set_named_property(env, result, "pid", val);
     
+    if (log_file) {
+        napi_create_string_utf8(env, log_file, NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "logFile", val);
+    }
+    
     napi_get_boolean(env, false, &val);
     napi_set_named_property(env, result, "error", val);
     
     free(id); free(bundle_arg); free(bundle_cleanup);
     free(state_root); free(console_socket);
-    free(pid_file); free(config_file_arg); free(config_file_cleanup);
+    free(pid_file); free(config_file_arg);
+    free(config_file_cleanup); free(log_file);
     
     return result;
 }
