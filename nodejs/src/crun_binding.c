@@ -1374,22 +1374,8 @@ napi_value CrunResume(napi_env env, napi_callback_info info) {
  * @param {string} id - شناسه کانتینر
  * @param {string|string[]} command - دستور (رشته یا آرایه)
  * @param {object} [options] - تنظیمات اختیاری
- * @param {string} [options.stateRoot] - مسیر state root
- * @param {boolean} [options.systemdCgroup] - استفاده از systemd cgroup
- * @param {boolean} [options.tty] - تخصیص pseudo-TTY
- * @param {boolean} [options.detach] - اجرا در پس‌زمینه
- * @param {string} [options.cwd] - دایرکتوری کاری
- * @param {string} [options.user] - کاربر به فرمت UID[:GID]
- * @param {string} [options.process] - مسیر فایل process.json
- * @param {string} [options.consoleSocket] - مسیر socket برای tty
- * @param {string} [options.pidFile] - مسیر فایل PID
- * @param {number} [options.preserveFds] - تعداد FD های اضافی
- * @param {boolean} [options.noNewPrivs] - تنظیم no new privileges
- * @param {string} [options.processLabel] - SELinux process label
- * @param {string} [options.apparmor] - AppArmor profile
- * @param {string[]} [options.env] - متغیرهای محیطی اضافی
- * @param {string[]} [options.cap] - capabilities اضافی
- * @param {string} [options.cgroup] - sub-cgroup path
+ * @param {string} [options.logFile] - مسیر فایل لاگ خروجی
+ * ... بقیه options مثل قبل ...
  */
 napi_value CrunExec(napi_env env, napi_callback_info info) {
     size_t argc = 3;
@@ -1449,6 +1435,7 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     char* process_label = NULL;
     char* apparmor = NULL;
     char* cgroup = NULL;
+    char* log_file = NULL; 
     bool systemd_cgroup = false;
     bool tty = false;
     bool detach = false;
@@ -1474,6 +1461,7 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
             process_label = get_string_property(env, args[2], "processLabel");
             apparmor = get_string_property(env, args[2], "apparmor");
             cgroup = get_string_property(env, args[2], "cgroup");
+            log_file = get_string_property(env, args[2], "logFile"); 
             systemd_cgroup = get_bool_property(env, args[2], "systemdCgroup", false);
             tty = get_bool_property(env, args[2], "tty", false);
             detach = get_bool_property(env, args[2], "detach", false);
@@ -1531,6 +1519,28 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
         }
     }
 
+    int saved_stdout = -1;
+    int saved_stderr = -1;
+    int log_fd = -1;
+    char auto_log_path[PATH_MAX] = {0};
+
+    if (log_file) {
+        log_fd = open(log_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    } else if (detach) {
+        snprintf(auto_log_path, sizeof(auto_log_path),
+                 "/tmp/crun-exec-%s-%d.log", id, getpid());
+        log_fd = open(auto_log_path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        log_file = auto_log_path;
+    }
+
+    if (log_fd >= 0) {
+        saved_stdout = dup(STDOUT_FILENO);
+        saved_stderr = dup(STDERR_FILENO);
+        dup2(log_fd, STDOUT_FILENO);
+        dup2(log_fd, STDERR_FILENO);
+    }
+
+
     libcrun_context_t crun_context = {0};
 
     crun_context.id = id;
@@ -1558,7 +1568,6 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     libcrun_error_t err = NULL;
     int ret;
 
-
     runtime_spec_schema_config_schema_process* process = NULL;
 
     if (process_path) {
@@ -1566,11 +1575,16 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     } else {
         process = (runtime_spec_schema_config_schema_process*)calloc(1, sizeof(*process));
         if (!process) {
+            if (saved_stdout >= 0) { dup2(saved_stdout, STDOUT_FILENO); close(saved_stdout); }
+            if (saved_stderr >= 0) { dup2(saved_stderr, STDERR_FILENO); close(saved_stderr); }
+            if (log_fd >= 0) close(log_fd);
+            
             for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
             free(cmd_args);
             free(id); free(state_root); free(console_socket);
             free(pid_file); free(process_path); free(cwd);
             free(user); free(process_label); free(apparmor); free(cgroup);
+            if (log_file != auto_log_path) free(log_file);
             for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
             free(extra_env);
             for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
@@ -1580,7 +1594,6 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
 
         process->args = cmd_args;
         process->args_len = cmd_args_len;
-
         process->terminal = tty;
 
         if (cwd)
@@ -1609,6 +1622,7 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
             process->selinux_label = process_label;
 
         if (apparmor)
+            process->apparmor_profile = apparmor;
 
         if (no_new_privs)
             process->no_new_privileges = 1;
@@ -1637,8 +1651,19 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     if (cgroup)
         exec_opts.cgroup = cgroup;
 
-
     ret = libcrun_container_exec_with_options(&crun_context, id, &exec_opts, &err);
+
+    if (saved_stdout >= 0) {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
+    if (log_fd >= 0) {
+        close(log_fd);
+    }
 
     if (process) {
         if (process->user) free(process->user);
@@ -1656,16 +1681,10 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
         free(id); free(state_root); free(console_socket);
         free(pid_file); free(process_path); free(cwd);
         free(user); free(process_label); free(apparmor); free(cgroup);
-        if (extra_env && !process) {
-            for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
-            free(extra_env);
-        }
-        if (extra_cap && (!process || !process_path)) {
-            for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
-            free(extra_cap);
-        }
+        if (log_file && log_file != auto_log_path) free(log_file);
         return error;
     }
+
 
     napi_create_object(env, &result);
 
@@ -1677,12 +1696,19 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     napi_create_int32(env, ret, &val);
     napi_set_named_property(env, result, "exitCode", val);
 
+    if (log_file) {
+        napi_create_string_utf8(env, log_file, NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "logFile", val);
+    }
+
     napi_get_boolean(env, false, &val);
     napi_set_named_property(env, result, "error", val);
+
 
     free(id); free(state_root); free(console_socket);
     free(pid_file); free(process_path); free(cwd);
     free(user); free(process_label); free(apparmor); free(cgroup);
+    if (log_file && log_file != auto_log_path) free(log_file);
 
     return result;
 }
