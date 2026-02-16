@@ -7,6 +7,12 @@
 #include "crun_binding.h"
 
 
+#include <signal.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
+#include <errno.h>
+
 static int binding_initialized = 0;
 
 char* napi_get_string(napi_env env, napi_value value) {
@@ -1713,6 +1719,452 @@ napi_value CrunExec(napi_env env, napi_callback_info info) {
     return result;
 }
 
+/**
+ * exec(id, command, options?) -> {id, exitCode, error}
+ */
+napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3], result;
+
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+
+    if (argc < 2) {
+        return napi_create_error_obj(env, -1,
+            "please specify a ID and command for the container");
+    }
+
+    char* id = napi_get_string(env, args[0]);
+    if (!id) {
+        return napi_create_error_obj(env, -1, "Invalid container id");
+    }
+
+    /* ── پارس کردن command ── */
+    char** cmd_args = NULL;
+    size_t cmd_args_len = 0;
+
+    napi_valuetype cmd_type;
+    napi_typeof(env, args[1], &cmd_type);
+
+    bool is_array = false;
+    if (cmd_type == napi_object) {
+        napi_is_array(env, args[1], &is_array);
+    }
+
+    if (is_array) {
+        uint32_t arr_len;
+        napi_get_array_length(env, args[1], &arr_len);
+        cmd_args = (char**)calloc(arr_len + 1, sizeof(char*));
+        cmd_args_len = arr_len;
+        for (uint32_t i = 0; i < arr_len; i++) {
+            napi_value elem;
+            napi_get_element(env, args[1], i, &elem);
+            cmd_args[i] = napi_get_string(env, elem);
+        }
+        cmd_args[arr_len] = NULL;
+    } else if (cmd_type == napi_string) {
+        cmd_args = (char**)calloc(2, sizeof(char*));
+        cmd_args[0] = napi_get_string(env, args[1]);
+        cmd_args[1] = NULL;
+        cmd_args_len = 1;
+    } else {
+        free(id);
+        return napi_create_error_obj(env, -1,
+            "command must be a string or array of strings");
+    }
+
+    /* ── پارس کردن options ── */
+    char* state_root     = NULL;
+    char* console_socket = NULL;
+    char* pid_file       = NULL;
+    char* process_path   = NULL;
+    char* cwd            = NULL;
+    char* user           = NULL;
+    char* process_label  = NULL;
+    char* apparmor       = NULL;
+    char* cgroup         = NULL;
+    bool  systemd_cgroup = false;
+    bool  tty            = false;
+    bool  detach         = false;
+    bool  no_new_privs   = false;
+    int   preserve_fds   = 0;
+
+    char** extra_env     = NULL;
+    size_t extra_env_len = 0;
+    char** extra_cap     = NULL;
+    size_t extra_cap_len = 0;
+
+    if (argc >= 3) {
+        napi_valuetype type;
+        napi_typeof(env, args[2], &type);
+
+        if (type == napi_object) {
+            state_root     = get_string_property(env, args[2], "stateRoot");
+            console_socket = get_string_property(env, args[2], "consoleSocket");
+            pid_file       = get_string_property(env, args[2], "pidFile");
+            process_path   = get_string_property(env, args[2], "process");
+            cwd            = get_string_property(env, args[2], "cwd");
+            user           = get_string_property(env, args[2], "user");
+            process_label  = get_string_property(env, args[2], "processLabel");
+            apparmor       = get_string_property(env, args[2], "apparmor");
+            cgroup         = get_string_property(env, args[2], "cgroup");
+            systemd_cgroup = get_bool_property(env, args[2], "systemdCgroup", false);
+            tty            = get_bool_property(env, args[2], "tty", false);
+            detach         = get_bool_property(env, args[2], "detach", false);
+            no_new_privs   = get_bool_property(env, args[2], "noNewPrivs", false);
+
+            napi_value pfd_val;
+            bool has_pfd;
+            napi_has_named_property(env, args[2], "preserveFds", &has_pfd);
+            if (has_pfd) {
+                napi_get_named_property(env, args[2], "preserveFds", &pfd_val);
+                napi_get_value_int32(env, pfd_val, &preserve_fds);
+            }
+
+            /* env array */
+            bool has_env;
+            napi_has_named_property(env, args[2], "env", &has_env);
+            if (has_env) {
+                napi_value env_val;
+                napi_get_named_property(env, args[2], "env", &env_val);
+                bool env_is_array;
+                napi_is_array(env, env_val, &env_is_array);
+                if (env_is_array) {
+                    uint32_t env_len;
+                    napi_get_array_length(env, env_val, &env_len);
+                    extra_env = (char**)calloc(env_len + 1, sizeof(char*));
+                    extra_env_len = env_len;
+                    for (uint32_t i = 0; i < env_len; i++) {
+                        napi_value elem;
+                        napi_get_element(env, env_val, i, &elem);
+                        extra_env[i] = napi_get_string(env, elem);
+                    }
+                    extra_env[env_len] = NULL;
+                }
+            }
+
+            /* cap array */
+            bool has_cap;
+            napi_has_named_property(env, args[2], "cap", &has_cap);
+            if (has_cap) {
+                napi_value cap_val;
+                napi_get_named_property(env, args[2], "cap", &cap_val);
+                bool cap_is_array;
+                napi_is_array(env, cap_val, &cap_is_array);
+                if (cap_is_array) {
+                    uint32_t cap_len;
+                    napi_get_array_length(env, cap_val, &cap_len);
+                    extra_cap = (char**)calloc(cap_len + 1, sizeof(char*));
+                    extra_cap_len = cap_len;
+                    for (uint32_t i = 0; i < cap_len; i++) {
+                        napi_value elem;
+                        napi_get_element(env, cap_val, i, &elem);
+                        extra_cap[i] = napi_get_string(env, elem);
+                    }
+                    extra_cap[cap_len] = NULL;
+                }
+            }
+        }
+    }
+
+    /* ── ساختن context ── */
+    libcrun_context_t crun_context = {0};
+    crun_context.id              = id;
+    crun_context.state_root      = state_root;
+    crun_context.systemd_cgroup  = systemd_cgroup ? 1 : 0;
+    crun_context.detach          = detach ? 1 : 0;
+    crun_context.fifo_exec_wait_fd = -1;
+    crun_context.preserve_fds    = preserve_fds;
+    crun_context.listen_fds      = 0;
+
+    if (console_socket)
+        crun_context.console_socket = console_socket;
+    if (pid_file)
+        crun_context.pid_file = pid_file;
+
+    if (getenv("LISTEN_FDS")) {
+        crun_context.listen_fds = strtoll(getenv("LISTEN_FDS"), NULL, 10);
+        crun_context.preserve_fds += crun_context.listen_fds;
+    }
+
+    /* ── ساختن exec options ── */
+    struct libcrun_container_exec_options_s exec_opts;
+    memset(&exec_opts, 0, sizeof(exec_opts));
+    exec_opts.struct_size = sizeof(exec_opts);
+
+    libcrun_error_t err = NULL;
+    int ret;
+
+    runtime_spec_schema_config_schema_process* process = NULL;
+
+    if (process_path) {
+        exec_opts.path = process_path;
+    } else {
+        process = (runtime_spec_schema_config_schema_process*)
+                      calloc(1, sizeof(*process));
+        if (!process) {
+            /* cleanup ... */
+            for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
+            free(cmd_args);
+            free(id); free(state_root); free(console_socket);
+            free(pid_file); free(process_path); free(cwd);
+            free(user); free(process_label); free(apparmor); free(cgroup);
+            for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
+            free(extra_env);
+            for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
+            free(extra_cap);
+            return napi_create_error_obj(env, -1, "Failed to allocate process");
+        }
+
+        process->args     = cmd_args;
+        process->args_len = cmd_args_len;
+        process->terminal = tty;
+
+        if (cwd)
+            process->cwd = cwd;
+
+        if (extra_env) {
+            process->env     = extra_env;
+            process->env_len = extra_env_len;
+        }
+
+        if (user) {
+            runtime_spec_schema_config_schema_process_user* u =
+                (runtime_spec_schema_config_schema_process_user*)
+                    calloc(1, sizeof(*u));
+            if (u) {
+                char* endptr = NULL;
+                errno = 0;
+                u->uid = strtol(user, &endptr, 10);
+                if (endptr && *endptr == ':')
+                    u->gid = strtol(endptr + 1, NULL, 10);
+                process->user = u;
+            }
+        }
+
+        if (process_label)
+            process->selinux_label = process_label;
+
+        /* ── باگ فیکس: apparmor ── */
+        if (apparmor)
+            process->apparmor_profile = apparmor;
+
+        if (no_new_privs)
+            process->no_new_privileges = 1;
+
+        if (extra_cap && extra_cap_len > 0) {
+            runtime_spec_schema_config_schema_process_capabilities* caps =
+                (runtime_spec_schema_config_schema_process_capabilities*)
+                    calloc(1, sizeof(*caps));
+            if (caps) {
+                caps->effective     = extra_cap;
+                caps->effective_len = extra_cap_len;
+                caps->bounding      = extra_cap;
+                caps->bounding_len  = extra_cap_len;
+                caps->ambient       = extra_cap;
+                caps->ambient_len   = extra_cap_len;
+                caps->permitted     = extra_cap;
+                caps->permitted_len = extra_cap_len;
+                caps->inheritable     = NULL;
+                caps->inheritable_len = 0;
+                process->capabilities = caps;
+            }
+        }
+
+        exec_opts.process = process;
+    }
+
+    if (cgroup)
+        exec_opts.cgroup = cgroup;
+
+    /* ════════════════════════════════════════════════════
+     *  اصل فیکس: TTY اینتراکتیو → fork helper process
+     *
+     *  چرا fork؟
+     *  ─────────
+     *  crun داخلاً از signalfd(SIGCHLD) + epoll استفاده
+     *  می‌کند تا متوجه خروج پروسه شل شود.
+     *
+     *  signalfd فقط وقتی سیگنال را می‌بیند که SIGCHLD
+     *  در تمام thread‌ها بلاک شده باشد. ولی Node.js
+     *  (V8) چندین thread داره که SIGCHLD رو بلاک
+     *  نکردند → سیگنال به اونها تحویل میشه → signalfd
+     *  هرگز نمی‌بینه → هنگ ابدی.
+     *
+     *  با fork() یک پروسه تمیز تک‌thread میسازیم که
+     *  فقط crun داخلش اجرا میشه → مشکل سیگنال حل میشه.
+     * ════════════════════════════════════════════════════ */
+
+    if (tty && !detach) {
+        /* ── ذخیره وضعیت ترمینال ── */
+        struct termios orig_termios;
+        bool have_termios = (tcgetattr(STDIN_FILENO, &orig_termios) == 0);
+
+        pid_t helper_pid = fork();
+
+        if (helper_pid < 0) {
+            /* fork شکست خورد */
+            if (process) {
+                if (process->user) free(process->user);
+                if (process->capabilities) free(process->capabilities);
+                free(process);
+            }
+            if (!process_path) {
+                for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
+                free(cmd_args);
+            }
+            free(id); free(state_root); free(console_socket);
+            free(pid_file); free(process_path); free(cwd);
+            free(user); free(process_label); free(apparmor); free(cgroup);
+            if (extra_env && !process) {
+                for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
+                free(extra_env);
+            }
+            if (extra_cap && !process) {
+                for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
+                free(extra_cap);
+            }
+            return napi_create_error_obj(env, -1, "fork() failed for TTY exec");
+        }
+
+        if (helper_pid == 0) {
+            /* ═══ پروسه فرزند (helper) ═══
+             *
+             * اینجا فقط یک thread وجود داره (thread فعلی).
+             * تمام thread‌های V8 و libuv از بین رفتند.
+             * signalfd بدون مشکل کار خواهد کرد.
+             */
+
+            /* ریست تمام signal handler‌ها */
+            struct sigaction sa_dfl;
+            memset(&sa_dfl, 0, sizeof(sa_dfl));
+            sa_dfl.sa_handler = SIG_DFL;
+            sigemptyset(&sa_dfl.sa_mask);
+            for (int sig = 1; sig < NSIG; sig++) {
+                sigaction(sig, &sa_dfl, NULL);
+            }
+
+            /* آنبلاک تمام سیگنال‌ها */
+            sigset_t empty_set;
+            sigemptyset(&empty_set);
+            pthread_sigmask(SIG_SETMASK, &empty_set, NULL);
+
+            /* اجرای crun exec */
+            libcrun_error_t child_err = NULL;
+            int child_ret = libcrun_container_exec_with_options(
+                &crun_context, id, &exec_opts, &child_err);
+
+            if (child_err)
+                libcrun_error_release(&child_err);
+
+            /* خروج با کد مناسب */
+            _exit(child_ret < 0 ? 127 : child_ret);
+        }
+
+        /* ═══ پروسه والد (Node.js) ═══
+         *
+         * منتظر خروج helper می‌مانیم.
+         * چون main thread بلاک شده، event loop libuv اجرا نمیشه
+         * و waitpid ما با libuv تداخل نمی‌کنه.
+         */
+        int status = 0;
+        while (waitpid(helper_pid, &status, 0) == -1) {
+            if (errno != EINTR) break;
+        }
+
+        /* ── بازگرداندن وضعیت ترمینال ── */
+        if (have_termios) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+        }
+
+        if (WIFEXITED(status))
+            ret = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status))
+            ret = 128 + WTERMSIG(status);
+        else
+            ret = -1;
+
+        /* آزاد کردن حافظه‌ها */
+        if (process) {
+            if (process->user) free(process->user);
+            if (process->capabilities) free(process->capabilities);
+            free(process);
+        }
+        if (!process_path) {
+            for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
+            free(cmd_args);
+        }
+
+        if (ret == 127) {
+            free(id); free(state_root); free(console_socket);
+            free(pid_file); free(process_path); free(cwd);
+            free(user); free(process_label); free(apparmor); free(cgroup);
+            if (extra_env) {
+                for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
+                free(extra_env);
+            }
+            if (extra_cap) {
+                for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
+                free(extra_cap);
+            }
+            return napi_create_error_obj(env, -1,
+                "TTY exec failed in helper process");
+        }
+
+    } else {
+        /* ═══ مسیر غیر‌TTY یا detach ═══
+         * بدون مشکل سیگنال، مستقیم اجرا می‌کنیم
+         */
+        ret = libcrun_container_exec_with_options(
+            &crun_context, id, &exec_opts, &err);
+
+        if (process) {
+            if (process->user) free(process->user);
+            if (process->capabilities) free(process->capabilities);
+            free(process);
+        }
+        if (!process_path) {
+            for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
+            free(cmd_args);
+        }
+
+        if (ret < 0) {
+            napi_value error = create_error_from_crun(env,
+                "Failed to exec in container", &err);
+            free(id); free(state_root); free(console_socket);
+            free(pid_file); free(process_path); free(cwd);
+            free(user); free(process_label); free(apparmor); free(cgroup);
+            if (extra_env) {
+                for (size_t i = 0; i < extra_env_len; i++) free(extra_env[i]);
+                free(extra_env);
+            }
+            if (extra_cap) {
+                for (size_t i = 0; i < extra_cap_len; i++) free(extra_cap[i]);
+                free(extra_cap);
+            }
+            return error;
+        }
+    }
+
+    /* ── ساختن نتیجه ── */
+    napi_create_object(env, &result);
+    napi_value val;
+
+    napi_create_string_utf8(env, id, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, result, "id", val);
+
+    napi_create_int32(env, ret, &val);
+    napi_set_named_property(env, result, "exitCode", val);
+
+    napi_get_boolean(env, false, &val);
+    napi_set_named_property(env, result, "error", val);
+
+    free(id); free(state_root); free(console_socket);
+    free(pid_file); free(process_path); free(cwd);
+    free(user); free(process_label); free(apparmor); free(cgroup);
+
+    return result;
+}
+
 napi_value CrunSpec(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1], result;
@@ -2453,6 +2905,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"update", NULL, CrunUpdate, NULL, NULL, NULL, napi_default, NULL},
         {"ps",      NULL, CrunPs,     NULL, NULL, NULL, napi_default, NULL},
         {"resourceUsage", NULL, CrunResourceUsage, NULL, NULL, NULL, napi_default, NULL},
+        {"execInractive", NULL, CrunExecInteractive, NULL, NULL, NULL, napi_default, NULL}
     };
     
     NAPI_CALL(env, napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props));
