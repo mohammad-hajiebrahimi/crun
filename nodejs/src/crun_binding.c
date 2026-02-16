@@ -13,6 +13,9 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <unistd.h>
+#include <pthread.h>
+
 static int binding_initialized = 0;
 
 char* napi_get_string(napi_env env, napi_value value) {
@@ -25,7 +28,7 @@ char* napi_get_string(napi_env env, napi_value value) {
     
     size_t len;
     napi_get_value_string_utf8(env, value, NULL, 0, &len);
-    
+
     char* str = (char*)malloc(len + 1);
     if (!str) return NULL;
     
@@ -651,6 +654,448 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
     return result;
 }
 
+
+typedef struct {
+    char   *data;
+    size_t  len;
+    size_t  cap;
+} dyn_buf_t;
+
+static void buf_init(dyn_buf_t *b) {
+    b->cap  = 4096;
+    b->len  = 0;
+    b->data = malloc(b->cap);
+    if (b->data) b->data[0] = '\0';
+}
+
+static void buf_append(dyn_buf_t *b, const char *chunk, size_t n) {
+    if (!b->data) return;
+    while (b->len + n + 1 > b->cap) {
+        b->cap *= 2;
+        char *tmp = realloc(b->data, b->cap);
+        if (!tmp) return;
+        b->data = tmp;
+    }
+    memcpy(b->data + b->len, chunk, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+typedef struct {
+    int        fd;           
+    int        mirror_fd;    
+    dyn_buf_t  buf;
+    pthread_t  thread;
+    bool       active;
+} pipe_reader_t;
+
+static void *reader_thread_fn(void *arg) {
+    pipe_reader_t *r = arg;
+    char chunk[4096];
+    ssize_t n;
+
+    while ((n = read(r->fd, chunk, sizeof chunk)) > 0) {
+        buf_append(&r->buf, chunk, n);
+
+        if (r->mirror_fd >= 0) {
+            ssize_t written = 0;
+            while (written < n) {
+                ssize_t w = write(r->mirror_fd, chunk + written, n - written);
+                if (w <= 0) break;
+                written += w;
+            }
+        }
+    }
+
+    close(r->fd);
+    return NULL;
+}
+
+static void reader_start(pipe_reader_t *r, int fd, int mirror_fd) {
+    r->fd        = fd;
+    r->mirror_fd = mirror_fd;
+    r->active    = true;
+    buf_init(&r->buf);
+    pthread_create(&r->thread, NULL, reader_thread_fn, r);
+}
+
+static void reader_wait(pipe_reader_t *r) {
+    if (r->active) {
+        pthread_join(r->thread, NULL);
+        r->active = false;
+    }
+}
+
+typedef struct {
+    char  *id;
+    char  *bundle;
+    char  *state_root;
+    char  *console_socket;
+    char  *pid_file;
+
+    bool   systemd_cgroup;
+    bool   detach;
+    bool   no_pivot;
+    bool   no_new_keyring;
+    int    preserve_fds;
+    int    listen_fds;
+
+    libcrun_container_t *container;
+
+    struct termios saved_termios;
+    bool           tty_saved;
+
+    pipe_reader_t  out_reader;
+    pipe_reader_t  err_reader;
+    char          *stdout_data; 
+    char          *stderr_data;
+
+    int    ret;
+    bool   has_error;
+    char   err_msg[2048];
+
+    napi_async_work work;
+    napi_deferred   deferred;
+} run_work_t;
+
+
+static void run_execute(napi_env env, void *data)
+{
+    (void)env;
+    run_work_t *w = data;
+
+    char *saved_cwd = getcwd(NULL, 0);
+
+    if (chdir(w->bundle) < 0) {
+        w->has_error = true;
+        snprintf(w->err_msg, sizeof w->err_msg,
+                 "chdir(%s): %s", w->bundle, strerror(errno));
+        if (saved_cwd) free(saved_cwd);
+        return;
+    }
+
+    int saved_fl[3] = { -1, -1, -1 };
+    if (!w->detach) {
+        for (int fd = 0; fd < 3; fd++) {
+            saved_fl[fd] = fcntl(fd, F_GETFL);
+            if (saved_fl[fd] != -1 && (saved_fl[fd] & O_NONBLOCK))
+                fcntl(fd, F_SETFL, saved_fl[fd] & ~O_NONBLOCK);
+        }
+    }
+
+    int out_pipe[2] = { -1, -1 };
+    int err_pipe[2] = { -1, -1 };
+    int orig_stdout = -1;
+    int orig_stderr = -1;
+
+    if (!w->detach) {
+        if (pipe(out_pipe) == 0) {
+            orig_stdout = dup(STDOUT_FILENO);
+            dup2(out_pipe[1], STDOUT_FILENO);
+            close(out_pipe[1]);
+            reader_start(&w->out_reader, out_pipe[0], orig_stdout);
+        }
+
+        if (pipe(err_pipe) == 0) {
+            orig_stderr = dup(STDERR_FILENO);
+            dup2(err_pipe[1], STDERR_FILENO);
+            close(err_pipe[1]);
+            reader_start(&w->err_reader, err_pipe[0], orig_stderr);
+        }
+    }
+
+    libcrun_error_t cerr = NULL;
+    libcrun_context_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+
+    ctx.id                = w->id;
+    ctx.bundle            = w->bundle;
+    ctx.state_root        = w->state_root;
+    ctx.systemd_cgroup    = w->systemd_cgroup ? 1 : 0;
+    ctx.detach            = w->detach ? 1 : 0;
+    ctx.no_pivot          = w->no_pivot;
+    ctx.no_new_keyring    = w->no_new_keyring;
+    ctx.preserve_fds      = w->preserve_fds + w->listen_fds;
+    ctx.listen_fds        = w->listen_fds;
+    ctx.fifo_exec_wait_fd = -1;
+
+    if (w->console_socket)
+        ctx.console_socket = w->console_socket;
+    if (w->pid_file)
+        ctx.pid_file = w->pid_file;
+
+    w->ret = libcrun_container_run(&ctx, w->container, 0, &cerr);
+
+    if (orig_stdout >= 0) {
+        dup2(orig_stdout, STDOUT_FILENO);
+        close(orig_stdout);
+        reader_wait(&w->out_reader);
+        w->stdout_data = w->out_reader.buf.data;
+        w->out_reader.buf.data = NULL;
+    }
+    if (orig_stderr >= 0) {
+        dup2(orig_stderr, STDERR_FILENO);
+        close(orig_stderr);
+        reader_wait(&w->err_reader);
+        w->stderr_data = w->err_reader.buf.data;
+        w->err_reader.buf.data = NULL;
+    }
+
+    if (w->ret < 0) {
+        w->has_error = true;
+        if (cerr && cerr->msg) {
+            snprintf(w->err_msg, sizeof w->err_msg, "%s", cerr->msg);
+            free(cerr->msg);
+            free(cerr);
+        } else {
+            snprintf(w->err_msg, sizeof w->err_msg,
+                     "libcrun_container_run failed (%d)", w->ret);
+        }
+    }
+
+    if (!w->detach) {
+        for (int fd = 0; fd < 3; fd++) {
+            if (saved_fl[fd] != -1)
+                fcntl(fd, F_SETFL, saved_fl[fd]);
+        }
+    }
+
+    if (saved_cwd) {
+        (void)chdir(saved_cwd);
+        free(saved_cwd);
+    }
+}
+
+
+static void run_complete(napi_env env, napi_status status, void *data)
+{
+    run_work_t *w = data;
+
+    if (w->tty_saved)
+        tcsetattr(STDIN_FILENO, TCSANOW, &w->saved_termios);
+
+    if (w->container)
+        libcrun_container_free(w->container);
+
+    if (w->has_error) {
+        napi_value obj, v;
+        napi_create_object(env, &obj);
+
+        napi_get_boolean(env, true, &v);
+        napi_set_named_property(env, obj, "error", v);
+
+        napi_create_int32(env, w->ret, &v);
+        napi_set_named_property(env, obj, "code", v);
+
+        napi_create_string_utf8(env, w->err_msg, NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, obj, "message", v);
+
+        napi_reject_deferred(env, w->deferred, obj);
+    } else {
+        napi_value obj, v;
+        napi_create_object(env, &obj);
+
+        napi_create_string_utf8(env, w->id, NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, obj, "id", v);
+
+        const char *st = w->detach ? "running" : "stopped";
+        napi_create_string_utf8(env, st, NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, obj, "status", v);
+
+        napi_create_string_utf8(env, w->bundle, NAPI_AUTO_LENGTH, &v);
+        napi_set_named_property(env, obj, "bundle", v);
+
+        napi_create_int32(env, w->ret, &v);
+        napi_set_named_property(env, obj, "exitCode", v);
+
+        if (w->stdout_data && w->stdout_data[0]) {
+            napi_create_string_utf8(env, w->stdout_data,
+                                    NAPI_AUTO_LENGTH, &v);
+        } else {
+            napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &v);
+        }
+        napi_set_named_property(env, obj, "stdout", v);
+
+        if (w->stderr_data && w->stderr_data[0]) {
+            napi_create_string_utf8(env, w->stderr_data,
+                                    NAPI_AUTO_LENGTH, &v);
+        } else {
+            napi_create_string_utf8(env, "", NAPI_AUTO_LENGTH, &v);
+        }
+        napi_set_named_property(env, obj, "stderr", v);
+
+        napi_get_boolean(env, false, &v);
+        napi_set_named_property(env, obj, "error", v);
+
+        napi_resolve_deferred(env, w->deferred, obj);
+    }
+
+    napi_delete_async_work(env, w->work);
+    free(w->id);
+    free(w->bundle);
+    free(w->state_root);
+    free(w->console_socket);
+    free(w->pid_file);
+    free(w->stdout_data);
+    free(w->stderr_data);
+    free(w->out_reader.buf.data);
+    free(w->err_reader.buf.data);
+    free(w);
+}
+
+
+napi_value CrunRunAsync(napi_env env, napi_callback_info info)
+{
+    size_t     argc = 3;
+    napi_value args[3];
+
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+
+    if (argc < 2) {
+        napi_throw_error(env, NULL,
+                         "run(id, bundle[, opts]) — id and bundle required");
+        return NULL;
+    }
+
+    char *id         = napi_get_string(env, args[0]);
+    char *bundle_arg = napi_get_string(env, args[1]);
+    if (!id || !bundle_arg) {
+        free(id); free(bundle_arg);
+        napi_throw_error(env, NULL, "Invalid id or bundle");
+        return NULL;
+    }
+
+    char *state_root     = NULL;
+    char *console_socket = NULL;
+    char *pid_file       = NULL;
+    char *cfg_name       = NULL;
+    bool  systemd_cgroup = false;
+    bool  detach         = true;
+    bool  no_pivot       = false;
+    bool  no_new_keyring = false;
+    int   preserve_fds   = 0;
+
+    if (argc >= 3) {
+        napi_valuetype t;
+        napi_typeof(env, args[2], &t);
+        if (t == napi_object) {
+            state_root     = get_string_property(env, args[2], "stateRoot");
+            console_socket = get_string_property(env, args[2], "consoleSocket");
+            pid_file       = get_string_property(env, args[2], "pidFile");
+            cfg_name       = get_string_property(env, args[2], "configFile");
+            systemd_cgroup = get_bool_property(env, args[2], "systemdCgroup", false);
+            detach         = get_bool_property(env, args[2], "detach", true);
+            no_pivot       = get_bool_property(env, args[2], "noPivot", false);
+            no_new_keyring = get_bool_property(env, args[2], "noNewKeyring", false);
+
+            napi_value pv;
+            bool hp;
+            napi_has_named_property(env, args[2], "preserveFds", &hp);
+            if (hp) {
+                napi_get_named_property(env, args[2], "preserveFds", &pv);
+                napi_get_value_int32(env, pv, &preserve_fds);
+            }
+        }
+    }
+
+    char *bundle;
+    if (bundle_arg[0] != '/') {
+        bundle = realpath(bundle_arg, NULL);
+        free(bundle_arg);
+    } else {
+        bundle = bundle_arg;
+    }
+    if (!bundle) {
+        free(id); free(state_root); free(console_socket);
+        free(pid_file); free(cfg_name);
+        napi_throw_error(env, NULL, "realpath(bundle) failed");
+        return NULL;
+    }
+
+    const char *cfg     = "config.json";
+    char       *cfg_abs = NULL;
+    if (cfg_name && strcmp(cfg_name, "config.json") != 0) {
+        if (cfg_name[0] != '/') {
+            cfg_abs = realpath(cfg_name, NULL);
+            if (!cfg_abs) {
+                free(id); free(bundle); free(state_root);
+                free(console_socket); free(pid_file); free(cfg_name);
+                napi_throw_error(env, NULL, "realpath(configFile) failed");
+                return NULL;
+            }
+            cfg = cfg_abs;
+        } else {
+            cfg = cfg_name;
+        }
+    }
+
+    char *saved_cwd = getcwd(NULL, 0);
+    if (chdir(bundle) < 0) {
+        free(id); free(bundle); free(saved_cwd);
+        free(state_root); free(console_socket);
+        free(pid_file); free(cfg_name); free(cfg_abs);
+        napi_throw_error(env, NULL, "chdir(bundle) failed");
+        return NULL;
+    }
+
+    libcrun_error_t cerr = NULL;
+    libcrun_container_t *ctr = libcrun_container_load_from_file(cfg, &cerr);
+
+    if (saved_cwd) {
+        (void)chdir(saved_cwd);
+        free(saved_cwd);
+    }
+    free(cfg_name);
+    free(cfg_abs);
+
+    if (!ctr) {
+        napi_value e = create_error_from_crun(env, "load config failed", &cerr);
+        free(id); free(bundle); free(state_root);
+        free(console_socket); free(pid_file);
+        return e;
+    }
+
+    run_work_t *w = calloc(1, sizeof *w);
+    w->id             = id;
+    w->bundle         = bundle;
+    w->state_root     = state_root;
+    w->console_socket = console_socket;
+    w->pid_file       = pid_file;
+    w->systemd_cgroup = systemd_cgroup;
+    w->detach         = detach;
+    w->no_pivot       = no_pivot;
+    w->no_new_keyring = no_new_keyring;
+    w->preserve_fds   = preserve_fds;
+    w->container      = ctr;
+    w->has_error      = false;
+    w->stdout_data    = NULL;
+    w->stderr_data    = NULL;
+    w->tty_saved      = false;
+
+    memset(&w->out_reader, 0, sizeof w->out_reader);
+    memset(&w->err_reader, 0, sizeof w->err_reader);
+
+    char *lf = getenv("LISTEN_FDS");
+    w->listen_fds = lf ? (int)strtol(lf, NULL, 10) : 0;
+
+    if (!detach && isatty(STDIN_FILENO)) {
+        tcgetattr(STDIN_FILENO, &w->saved_termios);
+        w->tty_saved = true;
+    }
+
+    napi_value promise;
+    napi_create_promise(env, &w->deferred, &promise);
+
+    napi_value res_name;
+    napi_create_string_utf8(env, "crun_run", NAPI_AUTO_LENGTH, &res_name);
+
+    napi_create_async_work(env, NULL, res_name,
+                           run_execute, run_complete,
+                           w, &w->work);
+    napi_queue_async_work(env, w->work);
+
+    return promise;
+}
 /**
  * kill(id, signal?, options?) -> {id, signal, success, error}
  * 
@@ -1738,7 +2183,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         return napi_create_error_obj(env, -1, "Invalid container id");
     }
 
-    /* ── پارس کردن command ── */
     char** cmd_args = NULL;
     size_t cmd_args_len = 0;
 
@@ -1772,7 +2216,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
             "command must be a string or array of strings");
     }
 
-    /* ── پارس کردن options ── */
     char* state_root     = NULL;
     char* console_socket = NULL;
     char* pid_file       = NULL;
@@ -1820,7 +2263,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
                 napi_get_value_int32(env, pfd_val, &preserve_fds);
             }
 
-            /* env array */
             bool has_env;
             napi_has_named_property(env, args[2], "env", &has_env);
             if (has_env) {
@@ -1842,7 +2284,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
                 }
             }
 
-            /* cap array */
             bool has_cap;
             napi_has_named_property(env, args[2], "cap", &has_cap);
             if (has_cap) {
@@ -1866,7 +2307,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         }
     }
 
-    /* ── ساختن context ── */
     libcrun_context_t crun_context = {0};
     crun_context.id              = id;
     crun_context.state_root      = state_root;
@@ -1886,7 +2326,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         crun_context.preserve_fds += crun_context.listen_fds;
     }
 
-    /* ── ساختن exec options ── */
     struct libcrun_container_exec_options_s exec_opts;
     memset(&exec_opts, 0, sizeof(exec_opts));
     exec_opts.struct_size = sizeof(exec_opts);
@@ -1902,7 +2341,7 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         process = (runtime_spec_schema_config_schema_process*)
                       calloc(1, sizeof(*process));
         if (!process) {
-            /* cleanup ... */
+
             for (size_t i = 0; i < cmd_args_len; i++) free(cmd_args[i]);
             free(cmd_args);
             free(id); free(state_root); free(console_socket);
@@ -1944,7 +2383,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         if (process_label)
             process->selinux_label = process_label;
 
-        /* ── باگ فیکس: apparmor ── */
         if (apparmor)
             process->apparmor_profile = apparmor;
 
@@ -1976,33 +2414,15 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
     if (cgroup)
         exec_opts.cgroup = cgroup;
 
-    /* ════════════════════════════════════════════════════
-     *  اصل فیکس: TTY اینتراکتیو → fork helper process
-     *
-     *  چرا fork؟
-     *  ─────────
-     *  crun داخلاً از signalfd(SIGCHLD) + epoll استفاده
-     *  می‌کند تا متوجه خروج پروسه شل شود.
-     *
-     *  signalfd فقط وقتی سیگنال را می‌بیند که SIGCHLD
-     *  در تمام thread‌ها بلاک شده باشد. ولی Node.js
-     *  (V8) چندین thread داره که SIGCHLD رو بلاک
-     *  نکردند → سیگنال به اونها تحویل میشه → signalfd
-     *  هرگز نمی‌بینه → هنگ ابدی.
-     *
-     *  با fork() یک پروسه تمیز تک‌thread میسازیم که
-     *  فقط crun داخلش اجرا میشه → مشکل سیگنال حل میشه.
-     * ════════════════════════════════════════════════════ */
 
     if (tty && !detach) {
-        /* ── ذخیره وضعیت ترمینال ── */
+
         struct termios orig_termios;
         bool have_termios = (tcgetattr(STDIN_FILENO, &orig_termios) == 0);
 
         pid_t helper_pid = fork();
 
         if (helper_pid < 0) {
-            /* fork شکست خورد */
             if (process) {
                 if (process->user) free(process->user);
                 if (process->capabilities) free(process->capabilities);
@@ -2027,14 +2447,7 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         }
 
         if (helper_pid == 0) {
-            /* ═══ پروسه فرزند (helper) ═══
-             *
-             * اینجا فقط یک thread وجود داره (thread فعلی).
-             * تمام thread‌های V8 و libuv از بین رفتند.
-             * signalfd بدون مشکل کار خواهد کرد.
-             */
 
-            /* ریست تمام signal handler‌ها */
             struct sigaction sa_dfl;
             memset(&sa_dfl, 0, sizeof(sa_dfl));
             sa_dfl.sa_handler = SIG_DFL;
@@ -2043,12 +2456,10 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
                 sigaction(sig, &sa_dfl, NULL);
             }
 
-            /* آنبلاک تمام سیگنال‌ها */
             sigset_t empty_set;
             sigemptyset(&empty_set);
             pthread_sigmask(SIG_SETMASK, &empty_set, NULL);
 
-            /* اجرای crun exec */
             libcrun_error_t child_err = NULL;
             int child_ret = libcrun_container_exec_with_options(
                 &crun_context, id, &exec_opts, &child_err);
@@ -2056,22 +2467,15 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
             if (child_err)
                 libcrun_error_release(&child_err);
 
-            /* خروج با کد مناسب */
             _exit(child_ret < 0 ? 127 : child_ret);
         }
 
-        /* ═══ پروسه والد (Node.js) ═══
-         *
-         * منتظر خروج helper می‌مانیم.
-         * چون main thread بلاک شده، event loop libuv اجرا نمیشه
-         * و waitpid ما با libuv تداخل نمی‌کنه.
-         */
+
         int status = 0;
         while (waitpid(helper_pid, &status, 0) == -1) {
             if (errno != EINTR) break;
         }
 
-        /* ── بازگرداندن وضعیت ترمینال ── */
         if (have_termios) {
             tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
         }
@@ -2083,7 +2487,6 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         else
             ret = -1;
 
-        /* آزاد کردن حافظه‌ها */
         if (process) {
             if (process->user) free(process->user);
             if (process->capabilities) free(process->capabilities);
@@ -2111,9 +2514,7 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         }
 
     } else {
-        /* ═══ مسیر غیر‌TTY یا detach ═══
-         * بدون مشکل سیگنال، مستقیم اجرا می‌کنیم
-         */
+
         ret = libcrun_container_exec_with_options(
             &crun_context, id, &exec_opts, &err);
 
@@ -2145,7 +2546,7 @@ napi_value CrunExecInteractive(napi_env env, napi_callback_info info) {
         }
     }
 
-    /* ── ساختن نتیجه ── */
+
     napi_create_object(env, &result);
     napi_value val;
 
@@ -2905,7 +3306,8 @@ napi_value Init(napi_env env, napi_value exports) {
         {"update", NULL, CrunUpdate, NULL, NULL, NULL, napi_default, NULL},
         {"ps",      NULL, CrunPs,     NULL, NULL, NULL, napi_default, NULL},
         {"resourceUsage", NULL, CrunResourceUsage, NULL, NULL, NULL, napi_default, NULL},
-        {"execInractive", NULL, CrunExecInteractive, NULL, NULL, NULL, napi_default, NULL}
+        {"execIntractive", NULL, CrunExecInteractive, NULL, NULL, NULL, napi_default, NULL},
+        {"runIntractive", NULL, CrunRunAsync, NULL, NULL, NULL, napi_default, NULL},
     };
     
     NAPI_CALL(env, napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props));
