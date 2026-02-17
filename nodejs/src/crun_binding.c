@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <pthread.h>
 
+#include <poll.h>
 static int binding_initialized = 0;
 
 char* napi_get_string(napi_env env, napi_value value) {
@@ -654,6 +655,261 @@ napi_value CrunRun(napi_env env, napi_callback_info info) {
     return result;
 }
 
+/*
+ * runDetached(id, bundle, options?) -> { id, status, error, message? }
+ * 
+ * Double fork: 
+ *   Node ──fork──► Child1 ──fork──► Grandchild (setsid, libcrun)
+ *                    │                    │
+ *                  _exit(0)           مستقل از Node
+ *                    │                    
+ *   Node ◄─waitpid──┘  (فوری)
+ */
+napi_value CrunRunDetached(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value args[3], result;
+    
+    NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+    
+    if (argc < 2) {
+        return napi_create_error_obj(env, -1, "please specify ID and bundle path");
+    }
+    
+    char* id         = napi_get_string(env, args[0]);
+    char* bundle_arg = napi_get_string(env, args[1]);
+    
+    if (!id || !bundle_arg) {
+        free(id); free(bundle_arg);
+        return napi_create_error_obj(env, -1, "Invalid id or bundle path");
+    }
+
+    /* ---- parse options ---- */
+    char* state_root     = NULL;
+    char* console_socket = NULL;
+    char* pid_file       = NULL;
+    char* config_file    = NULL;
+    char* log_file       = NULL;
+    bool  systemd_cgroup = false;
+    bool  no_pivot       = false;
+    bool  no_new_keyring = false;
+    int   preserve_fds   = 0;
+
+    if (argc >= 3) {
+        napi_valuetype type;
+        napi_typeof(env, args[2], &type);
+        if (type == napi_object) {
+            state_root     = get_string_property(env, args[2], "stateRoot");
+            console_socket = get_string_property(env, args[2], "consoleSocket");
+            pid_file       = get_string_property(env, args[2], "pidFile");
+            config_file    = get_string_property(env, args[2], "configFile");
+            log_file       = get_string_property(env, args[2], "logFile");
+            systemd_cgroup = get_bool_property(env, args[2], "systemdCgroup", false);
+            no_pivot       = get_bool_property(env, args[2], "noPivot", false);
+            no_new_keyring = get_bool_property(env, args[2], "noNewKeyring", false);
+            
+            napi_value pfd_val;
+            bool has_pfd;
+            napi_has_named_property(env, args[2], "preserveFds", &has_pfd);
+            if (has_pfd) {
+                napi_get_named_property(env, args[2], "preserveFds", &pfd_val);
+                napi_get_value_int32(env, pfd_val, &preserve_fds);
+            }
+        }
+    }
+    char* bundle;
+    if (bundle_arg[0] != '/') {
+        bundle = realpath(bundle_arg, NULL);
+        free(bundle_arg);
+        if (!bundle) {
+            free(id); free(state_root); free(console_socket);
+            free(pid_file); free(config_file); free(log_file);
+            return napi_create_error_obj(env, errno, "realpath bundle failed");
+        }
+    } else {
+        bundle = bundle_arg;
+    }
+
+    if (config_file && strcmp(config_file, "config.json") != 0 && config_file[0] != '/') {
+        char* abs = realpath(config_file, NULL);
+        free(config_file);
+        config_file = abs;
+    }
+
+    if (log_file && log_file[0] != '/') {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof(cwd))) {
+            char* abs = NULL;
+            asprintf(&abs, "%s/%s", cwd, log_file);
+            free(log_file);
+            log_file = abs;
+        }
+    }
+
+    int err_pipe[2];
+    if (pipe2(err_pipe, O_CLOEXEC) < 0) {
+        free(id); free(bundle); free(state_root); free(console_socket);
+        free(pid_file); free(config_file); free(log_file);
+        return napi_create_error_obj(env, errno, "pipe failed");
+    }
+
+    /* ======== FORK 1 ======== */
+    pid_t pid1 = fork();
+
+    if (pid1 < 0) {
+        close(err_pipe[0]); close(err_pipe[1]);
+        free(id); free(bundle); free(state_root); free(console_socket);
+        free(pid_file); free(config_file); free(log_file);
+        return napi_create_error_obj(env, errno, "fork failed");
+    }
+
+    if (pid1 == 0) {
+        /* ====== CHILD 1 ====== */
+        close(err_pipe[0]);  
+
+        pid_t pid2 = fork();  /* FORK 2 */
+
+        if (pid2 < 0) {
+            dprintf(err_pipe[1], "second fork failed: %s", strerror(errno));
+            close(err_pipe[1]);
+            _exit(1);
+        }
+
+        if (pid2 > 0) {
+
+            close(err_pipe[1]);
+            _exit(0);
+        }
+
+
+        setsid(); 
+
+        int dn = open("/dev/null", O_RDONLY);
+        if (dn >= 0) { dup2(dn, STDIN_FILENO); close(dn); }
+
+        if (log_file) {
+            int lfd = open(log_file, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (lfd >= 0) {
+                dup2(lfd, STDOUT_FILENO);
+                dup2(lfd, STDERR_FILENO);
+                close(lfd);
+            }
+        } else {
+            dn = open("/dev/null", O_WRONLY);
+            if (dn >= 0) {
+                dup2(dn, STDOUT_FILENO);
+                dup2(dn, STDERR_FILENO);
+                close(dn);
+            }
+        }
+
+        if (chdir(bundle) < 0) {
+            dprintf(err_pipe[1], "chdir failed: %s", strerror(errno));
+            close(err_pipe[1]);
+            _exit(1);
+        }
+
+
+        libcrun_error_t lerr = NULL;
+        const char* cfg = config_file ? config_file : "config.json";
+        libcrun_container_t* ctr = libcrun_container_load_from_file(cfg, &lerr);
+
+        if (!ctr) {
+            dprintf(err_pipe[1], "config load failed: %s",
+                    (lerr && lerr->msg) ? lerr->msg : "unknown");
+            if (lerr) crun_error_release(&lerr);
+            close(err_pipe[1]);
+            _exit(1);
+        }
+
+
+        libcrun_context_t ctx = {0};
+        ctx.id               = id;
+        ctx.bundle            = bundle;
+        ctx.state_root        = state_root;
+        ctx.systemd_cgroup    = systemd_cgroup ? 1 : 0;
+        ctx.detach            = 1;
+        ctx.no_pivot          = no_pivot;
+        ctx.no_new_keyring    = no_new_keyring;
+        ctx.preserve_fds      = preserve_fds;
+        ctx.fifo_exec_wait_fd = -1;
+        if (console_socket) ctx.console_socket = console_socket;
+        if (pid_file)       ctx.pid_file       = pid_file;
+
+        if (getenv("LISTEN_FDS")) {
+            ctx.listen_fds    = (int)strtoll(getenv("LISTEN_FDS"), NULL, 10);
+            ctx.preserve_fds += ctx.listen_fds;
+        }
+
+        int ret = libcrun_container_run(&ctx, ctr, 0, &lerr);
+        libcrun_container_free(ctr);
+
+        if (ret < 0) {
+            dprintf(err_pipe[1], "run failed: %s",
+                    (lerr && lerr->msg) ? lerr->msg : "unknown");
+            if (lerr) crun_error_release(&lerr);
+            close(err_pipe[1]);
+            _exit(1);
+        }
+
+        close(err_pipe[1]);
+        _exit(0);
+    }
+
+    close(err_pipe[1]);             
+    waitpid(pid1, NULL, 0);       
+
+    char err_buf[512] = {0};
+    bool has_error = false;
+
+    struct pollfd pfd = { .fd = err_pipe[0], .events = POLLIN };
+    int ready = poll(&pfd, 1, 1); 
+
+    if (ready > 0 && (pfd.revents & POLLIN)) {
+        ssize_t n = read(err_pipe[0], err_buf, sizeof(err_buf) - 1);
+        if (n > 0) {
+            err_buf[n] = '\0';
+            has_error = true;
+        }
+    }
+    close(err_pipe[0]);
+
+    napi_create_object(env, &result);
+    napi_value val;
+
+    napi_create_string_utf8(env, id, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, result, "id", val);
+
+    napi_create_string_utf8(env, bundle, NAPI_AUTO_LENGTH, &val);
+    napi_set_named_property(env, result, "bundle", val);
+
+    if (has_error) {
+        napi_get_boolean(env, true, &val);
+        napi_set_named_property(env, result, "error", val);
+
+        napi_create_string_utf8(env, err_buf, NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "message", val);
+
+        napi_create_string_utf8(env, "failed", NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "status", val);
+    } else {
+        napi_get_boolean(env, false, &val);
+        napi_set_named_property(env, result, "error", val);
+
+        napi_create_string_utf8(env, "starting", NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "status", val);
+    }
+
+    if (log_file) {
+        napi_create_string_utf8(env, log_file, NAPI_AUTO_LENGTH, &val);
+        napi_set_named_property(env, result, "logFile", val);
+    }
+
+    /* cleanup */
+    free(id); free(bundle); free(state_root); free(console_socket);
+    free(pid_file); free(config_file); free(log_file);
+
+    return result;
+}
 
 typedef struct {
     char   *data;
@@ -3115,7 +3371,6 @@ static char* read_cgroup_file_content(const char* path) {
     return content;
 }
 
-/* اضافه کردن یک فایل cgroup به آبجکت */
 static void add_cgroup_stat(napi_env env, napi_value obj,
                             const char* cgroup_path, const char* file,
                             const char* key) {
@@ -3135,7 +3390,6 @@ static void add_cgroup_stat(napi_env env, napi_value obj,
     napi_set_named_property(env, obj, key, val);
 }
 
-/* جمع‌آوری Memory Stats - دقیقاً مثل collectMemoryStats */
 static napi_value collect_memory_stats(napi_env env, const char* cgroup_path) {
     napi_value obj;
     napi_create_object(env, &obj);
@@ -3152,7 +3406,6 @@ static napi_value collect_memory_stats(napi_env env, const char* cgroup_path) {
     return obj;
 }
 
-/* جمع‌آوری CPU Stats - دقیقاً مثل collectCpuStats */
 static napi_value collect_cpu_stats(napi_env env, const char* cgroup_path) {
     napi_value obj;
     napi_create_object(env, &obj);
@@ -3171,7 +3424,6 @@ static napi_value collect_cpu_stats(napi_env env, const char* cgroup_path) {
     return obj;
 }
 
-/* جمع‌آوری IO Stats - دقیقاً مثل collectIoStats */
 static napi_value collect_io_stats(napi_env env, const char* cgroup_path) {
     napi_value obj;
     napi_create_object(env, &obj);
@@ -3199,8 +3451,7 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
     if (!id) {
         return napi_create_error_obj(env, -1, "Invalid container id");
     }
-    
-    /* خواندن options */
+
     char* state_root = NULL;
     
     if (argc >= 2) {
@@ -3212,8 +3463,7 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
     }
     
     const char* root = state_root ? state_root : "/run/crun";
-    
-    /* خواندن وضعیت کانتینر برای پیدا کردن cgroup_path */
+
     libcrun_error_t err = NULL;
     libcrun_container_status_t status = {0};
     
@@ -3224,8 +3474,7 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
         free(state_root);
         return error;
     }
-    
-    /* بررسی اینکه کانتینر در حال اجراست */
+
     int running = libcrun_is_container_running(&status, &err);
     if (running <= 0) {
         libcrun_free_container_status(&status);
@@ -3234,14 +3483,12 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
         return napi_create_error_obj(env, -1, "container is not running");
     }
     
-    /* ساخت مسیر cgroup */
     char cgroup_path[PATH_MAX];
     cgroup_path[0] = '\0';
     
     if (status.cgroup_path) {
         snprintf(cgroup_path, sizeof(cgroup_path), "/sys/fs/cgroup/%s", status.cgroup_path);
     } else {
-        /* fallback: خواندن از /proc/[pid]/cgroup */
         char proc_cgroup[PATH_MAX];
         snprintf(proc_cgroup, sizeof(proc_cgroup), "/proc/%d/cgroup", status.pid);
         
@@ -3268,10 +3515,8 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
         return napi_create_error_obj(env, -1, "Cannot find cgroup path");
     }
     
-    /* ساخت آبجکت نتیجه */
     napi_create_object(env, &result);
     
-    /* جمع‌آوری آمار - دقیقاً مثل کد اصلی */
     napi_value memory_stats = collect_memory_stats(env, cgroup_path);
     napi_set_named_property(env, result, "memoryStats", memory_stats);
     
@@ -3281,7 +3526,6 @@ napi_value CrunResourceUsage(napi_env env, napi_callback_info info) {
     napi_value io_stats = collect_io_stats(env, cgroup_path);
     napi_set_named_property(env, result, "ioStats", io_stats);
     
-    /* آزادسازی */
     libcrun_free_container_status(&status);
     free(id);
     free(state_root);
@@ -3308,6 +3552,7 @@ napi_value Init(napi_env env, napi_value exports) {
         {"resourceUsage", NULL, CrunResourceUsage, NULL, NULL, NULL, napi_default, NULL},
         {"execIntractive", NULL, CrunExecInteractive, NULL, NULL, NULL, napi_default, NULL},
         {"runIntractive", NULL, CrunRunAsync, NULL, NULL, NULL, napi_default, NULL},
+        {"runDetach", NULL, CrunRunDetached, NULL, NULL, NULL, napi_default, NULL},
     };
     
     NAPI_CALL(env, napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props));
